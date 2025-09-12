@@ -7,3 +7,5 @@ Flask==3.0.3
 # If you hit voice/opus issues, these help:
 PyNaCl==1.5.0
 opuslib==3.0.1
+audioop-lts==0.2.1
+
