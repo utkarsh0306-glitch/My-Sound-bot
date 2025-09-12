@@ -4,8 +4,8 @@ langdetect==1.0.9
 imageio-ffmpeg==0.4.9
 google-generativeai==0.8.3
 Flask==3.0.3
-# If you hit voice/opus issues, these help:
+# Voice stack helpers (safe to keep even if not always needed)
 PyNaCl==1.5.0
 opuslib==3.0.1
+# If Render uses Python 3.13, audioop is missing—this restores it:
 audioop-lts==0.2.1
-
