@@ -3,102 +3,112 @@ from discord.ext import commands
 from gtts import gTTS
 import asyncio
 import os
+from langdetect import detect, LangDetectException
 
 # --- 1. BOT SETUP ---
-# Define the permissions (Intents) the bot needs to function.
-# It needs to read messages and see who is in a voice channel.
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
+# <-- THE ONLY CHANGE IS HERE
+bot = commands.Bot(command_prefix='@', intents=intents)
 
-# Create the bot with a command prefix "!" and the defined intents.
-bot = commands.Bot(command_prefix='!', intents=intents)
-
+# This variable will store the ID of the channel the bot is listening to.
+listening_channel_id = None
 
 # --- 2. EVENT: WHEN THE BOT IS READY ---
 @bot.event
 async def on_ready():
     """This function runs when the bot has successfully connected to Discord."""
     print(f'✅ Logged in as {bot.user.name}')
-    print(f'Bot ID: {bot.user.id}')
-    print('Bot is online and ready to speak!')
+    print('Always-On TTS Bot is online!')
     print('------')
 
-
-# --- 3. COMMAND: !say ---
+# --- 3. COMMANDS: @join and @leave (On/Off Switches) ---
 @bot.command()
-async def say(ctx, language: str, *, text: str):
-    """
-    Converts text to speech and plays it in the user's voice channel.
-    Usage: !say <language> <text>
-    Supported Languages: english, hindi, hinglish
-    """
-
-    # First, check if the person who sent the command is in a voice channel.
+async def join(ctx):
+    """Makes the bot join your VC and start listening to the current text channel."""
+    global listening_channel_id
     if not ctx.author.voice:
-        await ctx.send("You need to be in a voice channel to use this command.")
+        await ctx.send("You are not connected to a voice channel.")
         return
+    
+    channel = ctx.author.voice.channel
+    if ctx.voice_client is not None:
+        await ctx.voice_client.move_to(channel)
+    else:
+        await channel.connect()
 
-    # Map the user-friendly language names to the codes gTTS understands.
-    lang_map = {
-        'english': 'en',
-        'hindi': 'hi',
-        'hinglish': 'hi'  # 'hi' code works well for Hinglish (mixed Hindi/English).
-    }
+    listening_channel_id = ctx.channel.id
+    await ctx.send(f"✅ Now reading all messages sent in **#{ctx.channel.name}**.")
 
-    # Check if the language the user provided is one we support.
-    lang_code = lang_map.get(language.lower())
-    if not lang_code:
-        await ctx.send("Invalid language. Please use 'english', 'hindi', or 'hinglish'.")
-        return
-
-    try:
-        # Connect to the voice channel the user is in.
-        voice_channel = ctx.author.voice.channel
-        voice_client = await voice_channel.connect()
-
-        # Generate the speech using Google Text-to-Speech (gTTS).
-        tts = gTTS(text=text, lang=lang_code, slow=False)
-        
-        # Save the generated speech to a temporary audio file.
-        speech_file = 'speech.mp3'
-        tts.save(speech_file)
-
-        # Play the audio file in the voice channel.
-        voice_client.play(discord.FFmpegPCMAudio(source=speech_file))
-
-        # Wait in the channel until the audio is finished playing.
-        while voice_client.is_playing():
-            await asyncio.sleep(1)
-
-        # Once done, disconnect from the voice channel.
-        await voice_client.disconnect()
-
-        # Clean up by deleting the temporary audio file.
-        os.remove(speech_file)
-
-    except Exception as e:
-        # Send an error message if something goes wrong.
-        await ctx.send(f"An error occurred: {e}")
-        # Make sure to disconnect and clean up if an error happens.
-        if ctx.voice_client:
-            await ctx.voice_client.disconnect()
-        if os.path.exists('speech.mp3'):
-            os.remove('speech.mp3')
-
-
-# --- 4. COMMAND: !leave (Optional but helpful) ---
 @bot.command()
 async def leave(ctx):
-    """Makes the bot leave its current voice channel."""
+    """Makes the bot leave the VC and stop listening."""
+    global listening_channel_id
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("I have left the voice channel.")
+        await ctx.send("I have left the voice channel and stopped listening.")
+        listening_channel_id = None
     else:
         await ctx.send("I am not in a voice channel.")
 
+# --- 4. EVENT: ON MESSAGE (The main logic!) ---
+@bot.event
+async def on_message(message):
+    """This event triggers for every message sent in any channel."""
+    global listening_channel_id
 
+    if message.author == bot.user:
+        await bot.process_commands(message) # Still process commands, even from itself
+        return
+
+    # First, process commands to ensure @join and @leave work for all users.
+    await bot.process_commands(message)
+
+    # After checking for commands, run the TTS logic if applicable.
+    if listening_channel_id is None or message.channel.id != listening_channel_id:
+        return
+
+    # Don't speak commands out loud.
+    if message.content.startswith('@'):
+        return
+
+    if not bot.voice_clients:
+        listening_channel_id = None
+        return
+
+    try:
+        # --- Clean up mentions and other Discord-specific text ---
+        cleaned_content = message.content
+        for user in message.mentions:
+            cleaned_content = cleaned_content.replace(f'<@{user.id}>', user.display_name)
+            cleaned_content = cleaned_content.replace(f'<@!{user.id}>', user.display_name)
+        for role in message.role_mentions:
+            cleaned_content = cleaned_content.replace(f'<@&{role.id}>', role.name)
+        for channel in message.channel_mentions:
+            cleaned_content = cleaned_content.replace(f'<#{channel.id}>', channel.name)
+        cleaned_content = cleaned_content.replace('@everyone', 'everyone')
+        cleaned_content = cleaned_content.replace('@here', 'here')
+        
+        text_to_say = f"{message.author.display_name} said: {cleaned_content}"
+        
+        lang_code = detect(cleaned_content)
+        if lang_code not in ['en', 'hi']:
+            lang_code = 'en'
+
+        tts = gTTS(text=text_to_say, lang=lang_code, slow=False)
+        speech_file = 'speech.mp3'
+        tts.save(speech_file)
+        
+        while bot.voice_clients[0].is_playing():
+            await asyncio.sleep(1)
+
+        bot.voice_clients[0].play(discord.FFmpegPCMAudio(source=speech_file))
+
+    except LangDetectException:
+        print(f"Could not detect language for: '{cleaned_content}'")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    
 # --- 5. RUN THE BOT ---
-# This line securely gets the bot's token from the hosting environment (like Render or Replit).
-# Make sure you have set up the 'DISCORD_TOKEN' secret!
 bot.run(os.environ.get('DISCORD_TOKEN'))
