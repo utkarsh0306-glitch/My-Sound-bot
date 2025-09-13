@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import threading
+import traceback
 
 # -------- Keep-alive web server for Render free Web Service --------
 from flask import Flask
@@ -198,39 +199,88 @@ async def on_message(message: discord.Message):
         first = False
         await tts_queue.put((vc, say, lang))
 
+# ------------------- Robust /join & /leave -------------------
 @tree.command(name="join", description="Join your voice channel and read messages from this text channel.")
 async def join(interaction: discord.Interaction):
+    """Defers fast, blocks Stage channels, longer timeout, clear errors."""
     global listening_channel_id
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You are not in a voice channel.", ephemeral=True)
-        return
+    await interaction.response.defer(ephemeral=False)
 
-    target_vc = interaction.user.voice.channel
-    vc = await ensure_voice_client()
     try:
+        vs = interaction.user.voice
+        # Block Stage channels (common cause of instant disconnects)
+        if not vs or not vs.channel or isinstance(vs.channel, discord.StageChannel):
+            await interaction.followup.send("❌ Please join a **regular Voice channel** (not a Stage channel) and try again.")
+            return
+
+        target_vc = vs.channel
+        vc = await ensure_voice_client()
+
+        # Connect or move with longer timeout & reconnect
         if vc and vc.channel != target_vc:
             await vc.move_to(target_vc)
         elif not vc:
-            await target_vc.connect()
-    except discord.ClientException as e:
-        await interaction.response.send_message(f"⚠️ Couldn’t connect: {e}", ephemeral=True)
-        return
+            await target_vc.connect(reconnect=True, timeout=20)
 
-    listening_channel_id = interaction.channel.id
-    await interaction.response.send_message(
-        f"✅ Joined **{target_vc.name}** and will read from **#{interaction.channel.name}**."
-    )
+        # Confirm actually connected
+        vc = await ensure_voice_client()
+        if not vc or not vc.is_connected():
+            await interaction.followup.send(
+                "⚠️ Couldn’t finalize the voice connection. Check my **Connect/Speak/Use Voice Activity** permissions and try again."
+            )
+            return
+
+        listening_channel_id = interaction.channel.id
+        await interaction.followup.send(
+            f"✅ Joined **{target_vc.name}** and will read messages from **#{interaction.channel.name}**."
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don’t have permission to **Connect/Speak/Use Voice Activity** in that channel.")
+    except discord.ClientException as e:
+        await interaction.followup.send(f"⚠️ Couldn’t connect: `{e}`")
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print("JOIN ERROR:", err)
+        print(traceback.format_exc())
+        await interaction.followup.send(f"⚠️ Join failed: `{err}`")
 
 @tree.command(name="leave", description="Leave the voice channel and stop reading.")
 async def leave(interaction: discord.Interaction):
     global listening_channel_id
+    await interaction.response.defer(ephemeral=False)
+    try:
+        vc = await ensure_voice_client()
+        if vc:
+            await vc.disconnect(force=True)
+            listening_channel_id = None
+            await interaction.followup.send("👋 Left the voice channel and stopped reading.")
+        else:
+            await interaction.followup.send("ℹ️ I am not in a voice channel.")
+    except Exception as e:
+        print("LEAVE ERROR:", e)
+        await interaction.followup.send("⚠️ Unexpected error while leaving.")
+
+# -------------------- Debug helpers --------------------
+@tree.command(name="vcinfo", description="Show current voice/text bind info for debugging.")
+async def vcinfo(interaction: discord.Interaction):
     vc = await ensure_voice_client()
-    if vc:
-        await vc.disconnect(force=True)
-        listening_channel_id = None
-        await interaction.response.send_message("👋 Left the voice channel and stopped reading.")
-    else:
-        await interaction.response.send_message("ℹ️ I am not in a voice channel.", ephemeral=True)
+    vc_state = f"connected to **{vc.channel.name}**" if vc else "not connected"
+    chan = bot.get_channel(listening_channel_id) if listening_channel_id else None
+    text_state = f"listening to **#{chan.name}**" if chan else "not listening to any text channel"
+    await interaction.response.send_message(f"🎙️ Voice: {vc_state}\n💬 Text: {text_state}")
+
+@tree.command(name="test", description="Speak a short line to test TTS (use /join first).")
+@app_commands.describe(text="What should I say?")
+async def test(interaction: discord.Interaction, text: str):
+    vc = await ensure_voice_client()
+    if not vc:
+        await interaction.response.send_message("❌ Not connected. Use **/join** first.", ephemeral=True)
+        return
+    normalized = gemini_normalize(text)
+    lang = "hi" if DEVANAGARI_RE.search(normalized) else "en"
+    await tts_queue.put((vc, f"{interaction.user.display_name} said: {normalized}", lang))
+    await interaction.response.send_message("✅ Queued a test line.")
 
 # ----------------------- Main ----------------------------
 if __name__ == "__main__":
